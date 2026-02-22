@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+vault.key
+vault_secure.db
+.env
