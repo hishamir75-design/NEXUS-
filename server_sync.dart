@@ -1,48 +1,104 @@
-import 'dart:convert';
+Import 'dart:convert';
+import 'dart:io';
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
+import 'package:hive/hive.dart';
 import 'security_utils.dart';
-import 'user_session.dart';
 
-class ServerSync {
-  static final Dio _dio = Dio(BaseOptions(
-    baseUrl: "https://your-server.com/api",
-    connectTimeout: 10000,
-    receiveTimeout: 10000,
-    headers: {"Content-Type": "application/json"},
-  ));
+class NexusSecurityLayer {
+  static final Dio dio = Dio();
 
-  static Future<void> upload(Map<String, dynamic> message) async {
-    try {
-      if (UserSession.jwtToken == null) return;
-      String encrypted = await SecurityUtils.encryptData(jsonEncode(message));
-      await _dio.post(
-        "/upload",
-        data: {"payload": encrypted},
-        options: Options(headers: {"Authorization": "Bearer ${UserSession.jwtToken}"}),
-      );
-    } catch (e) {
-      print("⚠️ Upload failed, will retry: $e");
-      // OfflineQueue هيتعامل مع Retry
-    }
+  // ================= CERTIFICATE PINNING =================
+  static void initSecurity() {
+    dio.httpClientAdapter = IOHttpClientAdapter()
+      ..createHttpClient = () {
+        final client = HttpClient();
+        client.badCertificateCallback =
+            (X509Certificate cert, String host, int port) {
+          // ⚠️ لازم تجيب fingerprint الحقيقي من السيرفر
+          const allowedFingerprint = "YOUR_REAL_CERT_HASH";
+          final certBytes = cert.der;
+          final digest = sha256.convert(certBytes).toString();
+          return digest == allowedFingerprint;
+        };
+        return client;
+      };
   }
 
-  static Future<List<Map<String, dynamic>>> download() async {
+  // ================= REQUEST SIGNING =================
+  static Future<Map<String, String>> signRequest(String body) async {
+    final timestamp = DateTime.now().millisecondsSinceEpoch.toString();
+    final nonce = DateTime.now().microsecondsSinceEpoch.toString();
+    final deviceId = await SecurityUtils.getDeviceId();
+    final raw = "$body|$timestamp|$nonce|$deviceId";
+    final signature = await SecurityUtils.hmacSha256(raw);
+
+    return {
+      "X-Signature": signature,
+      "X-Timestamp": timestamp,
+      "X-Nonce": nonce,
+      "X-Device-Id": deviceId,
+    };
+  }
+
+  // ================= RATE LIMIT =================
+  static DateTime? _lastCall;
+
+  static bool canCall() {
+    final now = DateTime.now();
+    if (_lastCall == null || now.difference(_lastCall!).inMilliseconds > 500) {
+      _lastCall = now;
+      return true;
+    }
+    return false;
+  }
+
+  // ================= AUDIT LOG =================
+  static Future<void> auditLog(String action, String status) async {
     try {
-      if (UserSession.jwtToken == null) return [];
-      final resp = await _dio.post(
-        "/download",
-        data: {"device_id": "unique_device_id"},
-        options: Options(headers: {"Authorization": "Bearer ${UserSession.jwtToken}"}),
+      await dio.post(
+        "/audit",
+        data: {
+          "action": action,
+          "status": status,
+          "time": DateTime.now().toIso8601String(),
+        },
       );
-      List<Map<String, dynamic>> messages = [];
-      for (var encMsg in resp.data['messages']) {
-        String decrypted = await SecurityUtils.decryptData(encMsg);
-        messages.add(jsonDecode(decrypted));
+    } catch (_) {
+      // متوقع يفشل أحياناً، نتجاهل
+    }
+  }
+}
+
+// ================= SYNC QUEUE =================
+Future<void> processSyncQueue() async {
+  final box = await Hive.openBox('offline_queue');
+
+  for (var key in box.keys) {
+    final data = box.get(key);
+
+    try {
+      // محاولة الإرسال
+      await NexusSecurityLayer.dio.post("/sync", data: data);
+      await box.delete(key); // نجح؟ امسحه من الذاكرة
+
+    } on DioException catch (e) {
+      if (e.response?.statusCode == 401) {
+        // 🚨 التوكن انتهى، وقف الـ Queue
+        print("🚨 Unauthorized! Stopping Queue and forcing Login.");
+        break;
       }
-      return messages;
-    } catch (e) {
-      print("⚠️ Download failed: $e");
-      return [];
+
+      if (e.type == DioExceptionType.connectionTimeout ||
+          e.type == DioExceptionType.connectionError) {
+        // 🌐 مشكلة نت بسيطة
+        print("🌐 Connection lost. Keeping message in queue for later.");
+        break; // وقف المحاولات مؤقتًا
+      }
+
+      // أي خطأ تاني (مثلاً 500 أو 400)
+      print("⚠️ Server Error: ${e.message}");
     }
   }
 }
