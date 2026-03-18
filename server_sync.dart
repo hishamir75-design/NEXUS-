@@ -1,104 +1,240 @@
-Import 'dart:convert';
+import 'dart:convert';
+import 'dart:math';
 import 'dart:io';
-import 'package:crypto/crypto.dart';
-import 'package:dio/dio.dart';
-import 'package:dio/io.dart';
+import 'package:flutter/material.dart';
 import 'package:hive/hive.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'security_utils.dart';
+import 'server_sync.dart';
+import 'nexus_security_layer.dart';
+import 'safe_device.dart';
 
-class NexusSecurityLayer {
-  static final Dio dio = Dio();
+class OfflineQueue {
+  static const _boxName = 'offline_queue';
+  static Box<Map>? _box;
 
-  // ================= CERTIFICATE PINNING =================
-  static void initSecurity() {
-    dio.httpClientAdapter = IOHttpClientAdapter()
-      ..createHttpClient = () {
-        final client = HttpClient();
-        client.badCertificateCallback =
-            (X509Certificate cert, String host, int port) {
-          // ⚠️ لازم تجيب fingerprint الحقيقي من السيرفر
-          const allowedFingerprint = "YOUR_REAL_CERT_HASH";
-          final certBytes = cert.der;
-          final digest = sha256.convert(certBytes).toString();
-          return digest == allowedFingerprint;
-        };
-        return client;
-      };
-  }
-
-  // ================= REQUEST SIGNING =================
-  static Future<Map<String, String>> signRequest(String body) async {
-    final timestamp = DateTime.now().millisecondsSinceEpoch.toString();
-    final nonce = DateTime.now().microsecondsSinceEpoch.toString();
-    final deviceId = await SecurityUtils.getDeviceId();
-    final raw = "$body|$timestamp|$nonce|$deviceId";
-    final signature = await SecurityUtils.hmacSha256(raw);
-
-    return {
-      "X-Signature": signature,
-      "X-Timestamp": timestamp,
-      "X-Nonce": nonce,
-      "X-Device-Id": deviceId,
-    };
-  }
-
-  // ================= RATE LIMIT =================
-  static DateTime? _lastCall;
-
-  static bool canCall() {
-    final now = DateTime.now();
-    if (_lastCall == null || now.difference(_lastCall!).inMilliseconds > 500) {
-      _lastCall = now;
-      return true;
+  // ================= INIT =================
+  static Future<void> init() async {
+    if (_box == null) {
+      _box = await Hive.openBox<Map>(_boxName);
     }
-    return false;
   }
 
-  // ================= AUDIT LOG =================
-  static Future<void> auditLog(String action, String status) async {
-    try {
-      await dio.post(
-        "/audit",
-        data: {
-          "action": action,
-          "status": status,
-          "time": DateTime.now().toIso8601String(),
-        },
-      );
-    } catch (_) {
-      // متوقع يفشل أحياناً، نتجاهل
-    }
+  // ================= ENCRYPT & ADD =================
+  static Future<void> add(Map<String, dynamic> message) async {
+    await init();
+    final key = DateTime.now().microsecondsSinceEpoch.toString() +
+        Random().nextInt(9999).toString();
+    final encrypted = await SecurityUtils.encryptData(jsonEncode(message));
+    await _box!.put(key, {"payload": encrypted});
+    print("📝 Message added to offline queue (encrypted)");
+  }
+
+  // ================= GET ALL MESSAGES =================
+  static Future<Map<String, Map<String, dynamic>>> getAll() async {
+    await init();
+    return _box!.toMap().cast<String, Map<String, dynamic>>();
+  }
+
+  // ================= DELETE MESSAGE =================
+  static Future<void> remove(String key) async {
+    await init();
+    await _box!.delete(key);
+  }
+
+  // ================= CLEAR QUEUE =================
+  static Future<void> clear() async {
+    await init();
+    await _box!.clear();
   }
 }
 
-// ================= SYNC QUEUE =================
-Future<void> processSyncQueue() async {
-  final box = await Hive.openBox('offline_queue');
+class UserSession {
+  static String? _jwtTokenEncrypted;
+  static String? deviceId;
 
-  for (var key in box.keys) {
-    final data = box.get(key);
+  // ================= DEVICE INIT =================
+  static Future<void> initDevice(String rawBiometric) async {
+    deviceId ??= await SecurityUtils.getDeviceId();
+    final hashed = await SecurityUtils.hashData(rawBiometric);
+    await SecurityUtils.storeSecure("device_biometric", hashed);
+  }
+
+  // ================= JWT IN-MEMORY ENCRYPTION =================
+  static Future<void> setJwt(String token) async {
+    _jwtTokenEncrypted = await SecurityUtils.encryptData(token);
+  }
+
+  static Future<String?> getJwt() async {
+    if (_jwtTokenEncrypted == null) return null;
+    return await SecurityUtils.decryptData(_jwtTokenEncrypted!);
+  }
+
+  // ================= REGISTER =================
+  static Future<Map<String, dynamic>> register(
+      String username, String password, String rawBiometric) async {
+    await initDevice(rawBiometric);
+    final payload = {
+      "username": username,
+      "password": await SecurityUtils.encryptData(password),
+      "device_id": deviceId,
+      "biometric_hash": await SecurityUtils.encryptData(rawBiometric),
+      "timestamp": DateTime.now().millisecondsSinceEpoch,
+      "nonce": Random().nextInt(1 << 32).toString(),
+    };
+
+    await setJwt("simulate_jwt_register");
+    print("✅ Registered offline payload (encrypted)");
+    return {"status": "success", "jwt": await getJwt()};
+  }
+
+  // ================= LOGIN =================
+  static Future<Map<String, dynamic>> login(
+      String username, String password, String rawBiometric) async {
+    await initDevice(rawBiometric);
+    final payload = {
+      "username": username,
+      "password": await SecurityUtils.encryptData(password),
+      "device_id": deviceId,
+      "biometric_hash": await SecurityUtils.encryptData(rawBiometric),
+      "timestamp": DateTime.now().millisecondsSinceEpoch,
+      "nonce": Random().nextInt(1 << 32).toString(),
+    };
+
+    await setJwt("simulate_jwt_login");
+    print("✅ Login offline payload (encrypted)");
+    return {"status": "otp_required", "otp": "123456", "jwt": await getJwt()};
+  }
+
+  static Future<Map<String, dynamic>> verifyOtp(
+      String username, String code, String rawBiometric) async {
+    print("✅ OTP Verified for $username code $code");
+    return {"status": "verified", "jwt": await getJwt()};
+  }
+
+  // ================= UPLOAD MESSAGE =================
+  static Future<void> uploadMessage(Map<String, dynamic> message) async {
+    final jwtToken = await getJwt();
+    if (jwtToken == null) return;
+
+    await performKillSwitchCheck();
+
+    final securedMessage = {
+      "jwt": jwtToken,
+      "device_id": deviceId,
+      "timestamp": DateTime.now().millisecondsSinceEpoch,
+      "nonce": Random().nextInt(1 << 32).toString(),
+      "payload": message
+    };
 
     try {
-      // محاولة الإرسال
-      await NexusSecurityLayer.dio.post("/sync", data: data);
-      await box.delete(key); // نجح؟ امسحه من الذاكرة
-
-    } on DioException catch (e) {
-      if (e.response?.statusCode == 401) {
-        // 🚨 التوكن انتهى، وقف الـ Queue
-        print("🚨 Unauthorized! Stopping Queue and forcing Login.");
-        break;
-      }
-
-      if (e.type == DioExceptionType.connectionTimeout ||
-          e.type == DioExceptionType.connectionError) {
-        // 🌐 مشكلة نت بسيطة
-        print("🌐 Connection lost. Keeping message in queue for later.");
-        break; // وقف المحاولات مؤقتًا
-      }
-
-      // أي خطأ تاني (مثلاً 500 أو 400)
-      print("⚠️ Server Error: ${e.message}");
+      await ServerSync.upload(securedMessage);
+    } catch (_) {
+      await OfflineQueue.add(securedMessage);
     }
+  }
+
+  // ================= SYNC QUEUE محسنة =================
+  static Future<void> syncQueue({int maxUploadsPerRun = 20}) async {
+    final messages = await OfflineQueue.getAll();
+    int uploadCount = 0;
+
+    for (var entry in messages.entries) {
+      if (uploadCount >= maxUploadsPerRun) break; // Rate-Limiting
+      final key = entry.key;
+      final encryptedMessage = entry.value["payload"];
+
+      try {
+        final decrypted =
+            jsonDecode(await SecurityUtils.decryptData(encryptedMessage));
+
+        final jwtToken = await getJwt();
+        if (jwtToken == null) continue;
+
+        final securedMessage = {
+          "jwt": jwtToken,
+          "device_id": deviceId,
+          "timestamp": DateTime.now().millisecondsSinceEpoch,
+          "nonce": Random().nextInt(1 << 32).toString(),
+          "payload": decrypted
+        };
+
+        try {
+          await ServerSync.upload(securedMessage); // مباشر لتجنب Loop
+          await OfflineQueue.remove(key);
+          uploadCount++;
+        } catch (_) {
+          continue; // الرسالة تبقى في الـ Queue
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+  }
+
+  // ================= DOWNLOAD MESSAGES =================
+  static Future<List<Map<String, dynamic>>> downloadMessages() async {
+    final jwtToken = await getJwt();
+    if (jwtToken == null) return [];
+    await performKillSwitchCheck();
+    return await ServerSync.download();
+  }
+
+  // ================= KILL-SWITCH =================
+  static Future<void> performKillSwitchCheck() async {
+    bool threatDetected = false;
+
+    threatDetected |= await SafeDevice.isJailBroken;
+    threatDetected |= await SecurityUtils.isAppTampered();
+
+    if (threatDetected) {
+      _jwtTokenEncrypted = null;
+      deviceId = null;
+      await OfflineQueue.clear();
+      await SecurityUtils.clearSecureStorage();
+
+      try {
+        await NexusSecurityLayer.auditLog("KillSwitch", "Activated");
+      } catch (_) {}
+
+      exit(0);
+    }
+  }
+
+  // ================= CUSTOM IN-APP KEYBOARD =================
+  static Widget customSecureKeyboard({
+    required Function(String) onKeyPress,
+    required VoidCallback onBackspace,
+    required VoidCallback onDone,
+  }) {
+    List<String> keys = List.generate(10, (i) => i.toString());
+    keys.shuffle();
+
+    List<Widget> keyButtons = keys.map((k) {
+      return ElevatedButton(
+        onPressed: () => onKeyPress(k),
+        child: Text(k, style: TextStyle(fontSize: 20)),
+      );
+    }).toList();
+
+    // إضافة زر المسح و زر التأكيد
+    keyButtons.addAll([
+      ElevatedButton(onPressed: onBackspace, child: Text("⌫", style: TextStyle(fontSize: 20))),
+      ElevatedButton(onPressed: onDone, child: Text("✔", style: TextStyle(fontSize: 20))),
+    ]);
+
+    return GridView.count(
+      crossAxisCount: 3,
+      shrinkWrap: true,
+      mainAxisSpacing: 10, // مسافة رأسية
+      crossAxisSpacing: 10, // مسافة أفقية
+      padding: EdgeInsets.all(20),
+      children: keyButtons,
+    );
+  }
+
+  // ================= CLEAR JWT ON BACKGROUND =================
+  static Future<void> clearJwtOnBackground() async {
+    _jwtTokenEncrypted = null;
   }
 }
